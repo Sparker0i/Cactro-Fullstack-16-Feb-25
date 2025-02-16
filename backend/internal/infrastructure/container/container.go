@@ -9,141 +9,139 @@ import (
 	"github.com/Sparker0i/cactro-polls/internal/infrastructure/database"
 	"github.com/Sparker0i/cactro-polls/internal/infrastructure/event"
 	"github.com/Sparker0i/cactro-polls/internal/infrastructure/logger"
-	"github.com/Sparker0i/cactro-polls/internal/infrastructure/server"
 	"github.com/Sparker0i/cactro-polls/internal/interface/api/handler"
 	"github.com/Sparker0i/cactro-polls/internal/interface/api/middleware"
-	"github.com/Sparker0i/cactro-polls/internal/interface/api/router"
 	"github.com/Sparker0i/cactro-polls/internal/interface/repository/postgres"
+	"github.com/gin-gonic/gin"
 )
 
 type Container struct {
-	cfg    *config.Config
-	mu     sync.Mutex
-	cached map[string]interface{}
+	cfg        *config.Config
+	mu         sync.Mutex
+	logger     logger.Logger
+	db         *database.Database
+	engine     *gin.Engine
+	components componentContainer
 }
 
-func NewContainer(cfg *config.Config) *Container {
-	return &Container{
-		cfg:    cfg,
-		cached: make(map[string]interface{}),
+type componentContainer struct {
+	eventBus    event.EventBus
+	pollRepo    repository.PollRepository
+	voteRepo    repository.VoteRepository
+	txManager   repository.TransactionManager
+	pollService service.PollService
+	middleware  *middleware.Middleware
+	pollHandler *handler.PollHandler
+}
+
+func NewContainer(cfg *config.Config) (*Container, error) {
+	c := &Container{
+		cfg: cfg,
 	}
+
+	// Initialize core components first
+	if err := c.initializeCore(); err != nil {
+		return nil, err
+	}
+
+	// Initialize other components
+	if err := c.initializeComponents(); err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
-func (c *Container) GetLogger() logger.Logger {
-	return c.singleton("logger", func() interface{} {
-		log, err := logger.NewLogger(&c.cfg.Logger)
-		if err != nil {
-			panic(err)
-		}
-		return log
-	}).(logger.Logger)
+func (c *Container) initializeCore() error {
+	// Initialize logger first
+	log, err := logger.NewLogger(&c.cfg.Logger)
+	if err != nil {
+		return err
+	}
+	c.logger = log
+
+	// Initialize database
+	db, err := database.NewDatabase(&c.cfg.Database)
+	if err != nil {
+		return err
+	}
+	c.db = db
+
+	return nil
 }
 
-func (c *Container) GetDatabase() *database.Database {
-	return c.singleton("database", func() interface{} {
-		db, err := database.NewDatabase(&c.cfg.Database)
-		if err != nil {
-			panic(err)
-		}
-		return db
-	}).(*database.Database)
-}
-
-func (c *Container) GetEventBus() event.EventBus {
-	return c.singleton("event_bus", func() interface{} {
-		return event.NewEventBus()
-	}).(event.EventBus)
-}
-
-func (c *Container) GetPollRepository() repository.PollRepository {
-	return c.singleton("poll_repository", func() interface{} {
-		return postgres.NewPollRepository(c.GetDatabase().Pool())
-	}).(repository.PollRepository)
-}
-
-func (c *Container) GetVoteRepository() repository.VoteRepository {
-	return c.singleton("vote_repository", func() interface{} {
-		return postgres.NewVoteRepository(c.GetDatabase().Pool())
-	}).(repository.VoteRepository)
-}
-
-func (c *Container) GetTransactionManager() repository.TransactionManager {
-	return c.singleton("transaction_manager", func() interface{} {
-		return postgres.NewTransactionManager(c.GetDatabase().Pool())
-	}).(repository.TransactionManager)
-}
-
-func (c *Container) GetPollService() service.PollService {
-	return c.singleton("poll_service", func() interface{} {
-		return service.NewPollService(
-			c.GetPollRepository(),
-			c.GetVoteRepository(),
-			c.GetTransactionManager(),
-			c.GetEventBus(),
-		)
-	}).(service.PollService)
-}
-
-func (c *Container) GetMiddleware() *middleware.Middleware {
-	return c.singleton("middleware", func() interface{} {
-		return middleware.NewMiddleware(c.GetLogger())
-	}).(*middleware.Middleware)
-}
-
-func (c *Container) GetPollHandler() *handler.PollHandler {
-	return c.singleton("poll_handler", func() interface{} {
-		return handler.NewPollHandler(c.GetPollService())
-	}).(*handler.PollHandler)
-}
-
-func (c *Container) GetRouter() *router.Router {
-	return c.singleton("router", func() interface{} {
-		r := router.NewRouter(
-			c.GetPollHandler(),
-			c.GetMiddleware(),
-		)
-		r.Setup()
-		return r
-	}).(*router.Router)
-}
-
-func (c *Container) GetHTTPServer() *server.Server {
-	return c.singleton("http_server", func() interface{} {
-		return server.NewServer(
-			c.GetRouter(),
-			c.GetLogger(),
-			c.cfg,
-		)
-	}).(*server.Server)
-}
-
-func (c *Container) singleton(key string, factory func() interface{}) interface{} {
+func (c *Container) initializeComponents() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if instance, exists := c.cached[key]; exists {
-		return instance
+	// Initialize event bus
+	c.components.eventBus = event.NewEventBus()
+
+	// Initialize repositories
+	c.components.pollRepo = postgres.NewPollRepository(c.db.Pool())
+	c.components.voteRepo = postgres.NewVoteRepository(c.db.Pool())
+	c.components.txManager = postgres.NewTransactionManager(c.db.Pool())
+
+	// Initialize service
+	c.components.pollService = service.NewPollService(
+		c.components.pollRepo,
+		c.components.voteRepo,
+		c.components.txManager,
+		c.components.eventBus,
+	)
+
+	// Initialize API components
+	c.components.middleware = middleware.NewMiddleware(c.logger)
+	c.components.pollHandler = handler.NewPollHandler(c.components.pollService)
+
+	return nil
+}
+
+func (c *Container) InitializeHTTP() *gin.Engine {
+	gin.SetMode(c.cfg.Server.Mode)
+	engine := gin.New()
+
+	// Setup middleware
+	engine.Use(c.components.middleware.RequestID())
+	engine.Use(c.components.middleware.Logger())
+	engine.Use(c.components.middleware.Recovery())
+
+	// Setup routes
+	api := engine.Group("/api")
+	{
+		polls := api.Group("/polls")
+		{
+			polls.POST("", c.components.pollHandler.CreatePoll)
+			polls.GET("", c.components.pollHandler.ListPolls)
+			polls.GET("/:id", c.components.pollHandler.GetPoll)
+			polls.POST("/:id/vote", c.components.pollHandler.Vote)
+		}
 	}
 
-	instance := factory()
-	c.cached[key] = instance
-	return instance
+	// Health check
+	engine.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status": "healthy",
+		})
+	})
+
+	c.engine = engine
+	return engine
+}
+
+func (c *Container) Logger() logger.Logger {
+	return c.logger
 }
 
 func (c *Container) Cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close database connection
-	if db, ok := c.cached["database"].(*database.Database); ok {
-		db.Close()
+	if c.components.eventBus != nil {
+		c.components.eventBus.Stop()
 	}
 
-	// Stop event bus
-	if eventBus, ok := c.cached["event_bus"].(event.EventBus); ok {
-		eventBus.Stop()
+	if c.db != nil {
+		c.db.Close()
 	}
-
-	// Clear cache
-	c.cached = make(map[string]interface{})
 }

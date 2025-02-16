@@ -7,24 +7,23 @@ import (
 
 	"github.com/Sparker0i/cactro-polls/internal/infrastructure/config"
 	"github.com/Sparker0i/cactro-polls/internal/infrastructure/logger"
-	"github.com/Sparker0i/cactro-polls/internal/interface/api/router"
 	"github.com/gin-gonic/gin"
 )
 
 type Server struct {
 	httpServer *http.Server
-	router     *router.Router
+	engine     *gin.Engine
 	logger     logger.Logger
 	cfg        *config.Config
 }
 
 func NewServer(
-	router *router.Router,
+	engine *gin.Engine,
 	logger logger.Logger,
 	cfg *config.Config,
 ) *Server {
 	return &Server{
-		router: router,
+		engine: engine,
 		logger: logger,
 		cfg:    cfg,
 	}
@@ -35,7 +34,7 @@ func (s *Server) Start() error {
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf("%s:%s", s.cfg.Server.Host, s.cfg.Server.Port),
-		Handler:      s.router.Engine(),
+		Handler:      s.engine,
 		ReadTimeout:  s.cfg.Server.TimeoutRead,
 		WriteTimeout: s.cfg.Server.TimeoutWrite,
 		IdleTimeout:  s.cfg.Server.TimeoutIdle,
@@ -56,8 +55,10 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down server")
 
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		return fmt.Errorf("failed to shutdown server: %w", err)
+	if s.httpServer != nil {
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			return fmt.Errorf("failed to shutdown server: %w", err)
+		}
 	}
 
 	return nil

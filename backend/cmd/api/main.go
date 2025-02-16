@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,20 +23,33 @@ func main() {
 	}
 
 	// Create dependency container
-	cont := container.NewContainer(cfg)
+	cont, err := container.NewContainer(cfg)
+	if err != nil {
+		log.Fatalf("Failed to initialize container: %v", err)
+	}
 	defer cont.Cleanup()
 
-	// Get logger
-	log := cont.GetLogger()
+	// Initialize HTTP server
+	engine := cont.InitializeHTTP()
 
-	// Set up and start server
-	server := cont.GetHTTPServer()
+	// Create server
+	srv := &http.Server{
+		Addr:         fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port),
+		Handler:      engine,
+		ReadTimeout:  cfg.Server.TimeoutRead,
+		WriteTimeout: cfg.Server.TimeoutWrite,
+		IdleTimeout:  cfg.Server.TimeoutIdle,
+	}
 
 	// Start server in a goroutine
 	go func() {
-		if err := server.Start(); err != nil {
-			log.Error("server error",
-				logger.Error(err), // Using the proper logger.Error field constructor
+		cont.Logger().Info("starting server",
+			logger.String("address", srv.Addr),
+			logger.String("mode", cfg.Server.Mode),
+		)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			cont.Logger().Error("server error",
+				logger.Error(err),
 			)
 			os.Exit(1)
 		}
@@ -45,19 +60,19 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Info("shutting down gracefully")
+	cont.Logger().Info("shutting down gracefully")
 
 	// Create shutdown context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Shutdown server
-	if err := server.Shutdown(ctx); err != nil {
-		log.Error("server forced to shutdown",
-			logger.Error(err), // Using the proper logger.Error field constructor
+	if err := srv.Shutdown(ctx); err != nil {
+		cont.Logger().Error("server forced to shutdown",
+			logger.Error(err),
 		)
 		os.Exit(1)
 	}
 
-	log.Info("server stopped")
+	cont.Logger().Info("server stopped")
 }
